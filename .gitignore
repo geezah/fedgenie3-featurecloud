@@ -1,0 +1,7 @@
+.idea
+.venv
+*.pyc
+controller_data
+local_data
+credentials.conf
+genie3/
