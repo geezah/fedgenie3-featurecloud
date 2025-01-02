@@ -17,7 +17,7 @@ from utils.simulation import create_partitions
 @app_state("initial", role=Role.BOTH)
 class InitialState(AppState):
     def register(self):
-        self.register_transition("terminal", role=Role.BOTH)
+        self.register_transition("compute_local_importance_matrix", role=Role.BOTH)
         self.register_transition("simulate_partitions", role=Role.COORDINATOR)
         self.register_transition("receive_partitions", role=Role.PARTICIPANT)
 
@@ -75,7 +75,7 @@ class InitialState(AppState):
         else:
             if server_config.simulation is not None:
                 return "receive_partitions"
-        return "terminal"
+        return "compute_local_importance_matrix"
 
 
 @app_state("simulate_partitions", role=Role.COORDINATOR)
@@ -203,7 +203,7 @@ class EvaluateLocal(AppState):
             results.auroc, send_to_self=True, memo="auroc"
         )
         self.log(f"Local AUROC: {results.auroc}")
-        
+
         if self.is_coordinator:
             return "aggregate"
         else:
