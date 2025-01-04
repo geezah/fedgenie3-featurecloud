@@ -1,36 +1,43 @@
 from pathlib import Path
+from shutil import copytree
 from typing import Any, Dict, List
 
 import numpy as np
+import wandb
 from FeatureCloud.app.engine.app import AppState, Role, app_state
-from numpy.typing import NDArray
-
 from genie3.data import GRNDataset, init_grn_dataset
 from genie3.eval import prepare_evaluation, run_evaluation
 from genie3.genie3 import calculate_importances, rank_genes_by_importance
-from schema import ParticipantConfig, ServerConfig
+from numpy.typing import NDArray
+from pandas import DataFrame
+
+from schema import CoordinatorConfig, ParticipantConfig
 from utils.aggregation import get_aggregation_strategy
 from utils.initial import read_config
 from utils.simulation import create_partitions
+
+INPUT_DIR_PATH = Path("/mnt/input")
+OUTPUT_DIR_PATH = Path("/mnt/output")
 
 
 @app_state("initial", role=Role.BOTH)
 class InitialState(AppState):
     def register(self):
-        self.register_transition("compute_local_importance_matrix", role=Role.BOTH)
+        self.register_transition(
+            "compute_local_importance_matrix", role=Role.BOTH
+        )
         self.register_transition("simulate_partitions", role=Role.COORDINATOR)
         self.register_transition("receive_partitions", role=Role.PARTICIPANT)
 
     def run(self):
         self.log("Initializing the application")
 
-        input_path = Path("/mnt/input")
-        self.log(f"Input path: {input_path}")
-        self.store("input_path", input_path)
+        self.log(f"Input directory path: {INPUT_DIR_PATH}")
+        self.log(f"Output directory path: {OUTPUT_DIR_PATH}")
 
         # Get the config path
-        client_config_path = input_path / "client.yaml"
-        server_config_path = input_path / "server.yaml"
+        client_config_path = INPUT_DIR_PATH / "client.yaml"
+        server_config_path = INPUT_DIR_PATH / "server.yaml"
 
         self.log(f"Client Config path: {client_config_path}")
         self.log(f"Server Config path: {server_config_path}")
@@ -45,18 +52,20 @@ class InitialState(AppState):
         self.log(f"Participant Config: {participant_config}")
 
         server_config_dict: Dict[str, Any] = read_config(server_config_path)
-        server_config: ServerConfig = ServerConfig(**server_config_dict)
+        server_config: CoordinatorConfig = CoordinatorConfig(
+            **server_config_dict
+        )
         self.store("server_config", server_config)
         self.log(f"Server Config: {server_config}")
 
         gene_expressions_path = (
-            input_path / participant_config.data.gene_expressions_path
+            INPUT_DIR_PATH / participant_config.data.gene_expressions_path
         )
         transcription_factors_path = (
-            input_path / participant_config.data.transcription_factors_path
+            INPUT_DIR_PATH / participant_config.data.transcription_factors_path
         )
         reference_network_path = (
-            input_path / participant_config.data.reference_network_path
+            INPUT_DIR_PATH / participant_config.data.reference_network_path
         )
 
         self.log(f"Gene expressions path: {gene_expressions_path}")
@@ -87,7 +96,7 @@ class SimulatePartitions(AppState):
 
     def run(self):
         dataset: GRNDataset = self.load("dataset")
-        server_config: ServerConfig = self.load("server_config")
+        server_config: CoordinatorConfig = self.load("server_config")
         indices_partitions: List[NDArray[np.int32]] = create_partitions(
             dataset,
             simulation_type=server_config.simulation.strategy,
@@ -216,7 +225,7 @@ class AggregationState(AppState):
         self.register_transition("evaluate_global", role=Role.COORDINATOR)
 
     def run(self):
-        server_config: ServerConfig = self.load("server_config")
+        server_config: CoordinatorConfig = self.load("server_config")
         dataset: GRNDataset = self.load("dataset")
 
         # Gather data from participants
@@ -226,20 +235,33 @@ class AggregationState(AppState):
         sample_sizes: List[int] = self.gather_data(memo="num_samples")
 
         # Aggregate the importance scores using the specified strategy
-        aggregation_strategy = get_aggregation_strategy(
-            server_config.aggregation.name
-        )
-        global_importance_scores = aggregation_strategy(
-            local_importance_scores,
-            sample_sizes,
-            **server_config.aggregation.params,
-        )
-        global_predicted_network = rank_genes_by_importance(
-            global_importance_scores,
-            dataset._transcription_factor_indices,
-            dataset._gene_names,
-        )
-        self.store("global_predicted_network", global_predicted_network)
+        if not isinstance(server_config.aggregation, list):
+            server_config.aggregation = [server_config.aggregation]
+
+        global_importance_matrices: Dict[str, NDArray] = {}
+        global_predicted_networks: Dict[str, DataFrame] = {}
+        for aggregation_config in server_config.aggregation:
+            aggregation_strategy = get_aggregation_strategy(
+                aggregation_config.name
+            )
+            global_importance_matrices[f"{aggregation_config.name}"] = (
+                aggregation_strategy(
+                    local_importance_scores,
+                    sample_sizes,
+                    **aggregation_config.params,
+                )
+            )
+            global_predicted_network = rank_genes_by_importance(
+                global_importance_matrices[f"{aggregation_config.name}"],
+                dataset._transcription_factor_indices,
+                dataset._gene_names,
+            )
+            global_predicted_networks[f"{aggregation_config.name}"] = (
+                aggregation_config.params,
+                global_predicted_network,
+            )
+        self.store("global_importance_matrices", global_importance_matrices)
+        self.store("global_predicted_networks", global_predicted_networks)
         return "evaluate_global"
 
 
@@ -250,7 +272,11 @@ class EvaluateGlobal(AppState):
 
     def run(self):
         dataset: GRNDataset = self.load("dataset")
-        global_predicted_network = self.load("global_predicted_network")
+        global_predicted_networks: Dict[str, DataFrame] = self.load(
+            "global_predicted_networks"
+        )
+        participant_config: ParticipantConfig = self.load("participant_config")
+        server_config: CoordinatorConfig = self.load("server_config")
 
         local_aurocs: List[float] = self.gather_data(memo="auroc")
         self.log(f"Local AUROCs: {local_aurocs}")
@@ -261,9 +287,60 @@ class EvaluateGlobal(AppState):
         )
         self.log(f"Average local AUROC: {local_aurocs_average}")
 
-        y_preds, y_true = prepare_evaluation(
-            global_predicted_network, dataset.reference_network
-        )
-        results = run_evaluation(y_preds, y_true)
-        self.log(f"Global AUROC: {results.auroc}")
+        wandb_config = {
+            "data.gene_expressions_path": participant_config.data.gene_expressions_path,
+            "data.transcription_factors_path": participant_config.data.transcription_factors_path,
+            "data.reference_network_path": participant_config.data.reference_network_path,
+            "simulation.strategy": server_config.simulation.strategy,
+            "num_sites": len(self.clients),
+            "regressor.name": participant_config.regressor.name,
+            "regressor.init_params": participant_config.regressor.init_params,
+            "regressor.fit_params": participant_config.regressor.fit_params,
+            "aggregation.name": "local",
+            "aggregation.params": {},
+        }
+
+        with wandb.init(
+            project="fedgenie3",
+            config=wandb_config,
+            mode="offline",
+        ) as run:
+            run.log({"auroc": local_aurocs})
+
+        for aggregation_name, (
+            aggregation_params,
+            global_predicted_network,
+        ) in global_predicted_networks.items():
+            self.log(
+                f"Aggregation: {aggregation_name} with params: {aggregation_params}"
+            )
+            self.log(
+                f"Global predicted network: {global_predicted_network.head(2)}"
+            )
+            y_preds, y_true = prepare_evaluation(
+                global_predicted_network, dataset.reference_network
+            )
+            results = run_evaluation(y_preds, y_true)
+            wandb_config = {
+                "data.gene_expressions_path": participant_config.data.gene_expressions_path,
+                "data.transcription_factors_path": participant_config.data.transcription_factors_path,
+                "data.reference_network_path": participant_config.data.reference_network_path,
+                "simulation.strategy": server_config.simulation.strategy,
+                "num_sites": len(self.clients),
+                "regressor.name": participant_config.regressor.name,
+                "regressor.init_params": participant_config.regressor.init_params,
+                "regressor.fit_params": participant_config.regressor.fit_params,
+                "aggregation.name": aggregation_name,
+                "aggregation.params": aggregation_params,
+            }
+            with wandb.init(
+                project="fedgenie3",
+                config=wandb_config,
+                mode="offline",
+            ) as run:
+                run.log({"auroc": results.auroc})
+            self.log(f"Global AUROC: {results.auroc}")
+
+        copytree("./wandb", OUTPUT_DIR_PATH / "wandb")
+
         return "terminal"

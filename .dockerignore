@@ -2,4 +2,7 @@
 .idea
 *.pyc
 .gitattributes
+notebooks/
+controller_data
 credentials.conf
+

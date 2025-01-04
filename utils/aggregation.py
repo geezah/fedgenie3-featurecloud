@@ -7,9 +7,11 @@ VARIANCE_UPPER_BOUND = 0.25  # Since importance values are in [0, 1]
 
 
 def get_aggregation_strategy(strategy: str):
+    if strategy == "uniform":
+        return uniform_weighting
     if strategy == "sample-size":
         return sample_size_weighting
-    elif strategy == "inverse-variance":
+    elif strategy == "variance-decay":
         return variance_decay_weighting
     elif strategy == "combined":
         return combined_weighting
@@ -50,8 +52,6 @@ def variance_decay_weighting(
     importances = apply_weights_arraywise(importances, None)
     return importances
 
-#TODO : Uniform weighting (control)
-
 def sample_size_weighting(
     importances: NDArray, sample_sizes: List[int], **kwargs
 ) -> NDArray:
@@ -62,6 +62,23 @@ def sample_size_weighting(
     importances = apply_weights_arraywise(importances, weights)
     return importances
 
+def uniform_weighting(
+    importances: NDArray, sample_sizes: List[int], **kwargs
+) -> NDArray:
+    """
+    Applies uniform weighting to importance values.
+    """
+    weights = get_uniform_weights(sample_sizes)
+    importances = apply_weights_arraywise(importances, weights)
+    return importances
+
+def get_uniform_weights(sample_sizes: List[int]) -> NDArray:
+    """
+    Computes uniform weights.
+    """
+
+    weights = np.ones(len(sample_sizes)) / len(sample_sizes)
+    return weights
 
 def get_sample_size_weights(sample_sizes: List[int]) -> NDArray:
     """
@@ -72,7 +89,6 @@ def get_sample_size_weights(sample_sizes: List[int]) -> NDArray:
         raise ValueError("Total sample size must be greater than zero.")
     weights = np.divide(np.array(sample_sizes), total_samples)
     return weights
-
 
 def get_variance_decay_weights(
     importances: NDArray, decay_exponent: float = 2
