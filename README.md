@@ -1,160 +1,239 @@
-# FeatureCloud App Blank Template
+# Federated GENIE3 for FeatureCloud
 
-The app-blank template contains an initial state that does not execute commands other than transitioning to the terminal state.
-This template is a starting point for implementing apps by adding more states and operations.
- 
+This is an implementation of federated GENIE3 (GEne Network Inference with Ensemble of trees) for the FeatureCloud platform. It enables privacy-preserving gene regulatory network (GRN) inference across multiple data sites without sharing raw data.
 
-For registering and testing your apps or using other apps, please visit
-[FeatureCloud.ai](https://featurecloud.ai/). And for more information about FeatureCloud architecture,
-please refer to 
-[The FeatureCloud AI Store for Federated Learning in Biomedicine and Beyond](https://arxiv.org/abs/2105.05734) [[1]](#1).
+## Description
 
+Federated GENIE3 extends the original GENIE3 approach to a distributed setting. Like GENIE3, it treats network inference as a feature selection problem: each site predicts gene expression levels using other genes (especially transcription factors) as features. However, instead of computing importance scores centrally, each site calculates them locally using their private gene expression data. These local importance scores are then securely aggregated to estimate regulatory link strengths across the entire network. This federated approach enables multiple institutions to collaboratively infer gene regulatory networks while keeping their sensitive genomic data private and local, ultimately resulting in a more accurate and robust network inference.
 
-## Developing Apps using FeatureCloud library
-FeatureCloud library facilitates app development inside the FeatureCloud platform. To develop apps, developers
-should define their states and register them to the default app.
+## Usage on FeatureCloud
 
-### defining new states
-For defining new states, in general, developers can use [`AppState`](engine/README.md#appstate-defining-custom-states)
-which supports further communications, transitions, logging, and operations.
+### Features
 
-#### AppState
-[`AppState`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine#appstate-defining-custom-states) is the building block of FeatureCloud apps that covers
-all the scenarios with the verifying mechanism. Each state of 
-the app should extend [`AppState`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine#appstate-defining-custom-states), which is an abstract class with two specific abstract methods:
-- [`register`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine/README.md#registering-a-specific-transition-for-state-register_transition):
-should be implemented by apps to register possible transitions between the current state to other states.
-This method is part of verifying mechanism in FeatureCloud apps that ensures logically eligible roles can participate in the current state
-and transition to other ones.
-- [`run`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine/README.md#executing-states-computation-run): executes all operations and calls for communication between FeatureCloud clients.
-`run` is another part of the verification mechanism in the FeatureCloud library that ensures the transitions to other states are logically correct
-by returning the name of the next state.
+- **Privacy-Preserving**: Raw gene expression data never leaves local sites
+- **Multiple Aggregation Strategies**:
+  - Sample-size weighting (Weighting based on number of samples)
+  - Invariance weighting (Weighting based on number of samples + invariance of the feature importances across sites)
+- **Multiple Regressor Support**: Supports various tree-based ensemble methods:
+  - Random Forest
+  - Extra Trees
+  - Gradient Boosting
 
+### Input
 
-### Registering apps
-For each state, developers should extend one of the abstract states and call the helper function to register automatically
-the state in the default FeatureCloud app:
+- Gene expression data: A tab-separated file with genes as columns and samples as rows.
+- Transcription factor list: A tab-separated file with one column containing transcription factor names.
+- Coordinator Configuration: A yaml file specifying global parameters, for instance:
+  
+  ```yaml
+  aggregation:
+    name: "invariance-weighting"  # Options: sample-size-weighting, invariance-weighting. # See src/aggregation.py
+    params: 
+      decay_exponent: 2 
+  regressor:
+    name: "ExtraTreesRegressor"  # Options: See https://github.com/geezah/genie3/blob/main/genie3/regressor/__init__.py
+  ```
 
-```angular2html
-@app_state(name='initial', role=Role.BOTH, app_name='example')
-class ExampleState(AppState):
-    def register(self):
-        self.register_transition('terminal', Role.BOTH)
+- Client Configuration: A yaml file specifying names of the tab-separated files containing gene expression levels and transcription factors respectively, for instance:
+  
+  ```yaml
+  data:
+    gene_expressions_path: name_of_gene_expression_file.tsv
+    transcription_factors_path: name_of_transcription_factors_file.tsv # Optional, but recommended. If not provided, the application will consider all genes as transcription factors.
+  ```
 
-    def run(self):
-        self.read_config()
-        self.app.log(self.config)
-        return 'terminal'
+For detailed information on the configuration schema, see [the configuration schema of this application](src/config.py) and [the configuration schema of the core package](https://github.com/geezah/genie3/blob/main/genie3/config.py).  
+
+### Data Format
+
+The expected format of the data files. The header rows are expected to be present in the respective files.
+
+#### Gene Expression Data
+
+A tab-separated file with genes as columns, samples as rows, and gene expression values as entries:
+
+```csv
+        Gene1   Gene2   Gene3   ...  # Header row
+Sample1 0.5     1.2     0.8     ...
+Sample2 0.7     0.9     1.1     ...
+...
 ```
 
-### building the app docker image
-Once app implementation is done, building the docker image for testing or adding it to
-[FeatureCloud AI store](https://featurecloud.ai/ai-store?view=store&q=&r=0),
-developers should provide the following files.
-#### Dockerization files
+#### Transcription Factor List
 
-For dockerizing apps, regardless of their applications, there should be some specific files:
+A tab-separated file with one column containing transcription factor names. The transcription factors are expected to be present in the columns of the gene expression data.
 
-1. [Dockerfile](Dockerfile)
-2. [server-config](server_config)
-   - [docker-entrypoint.sh](server_config/docker-entrypoint.sh)
-   - [nginx](server_config/nginx)
-   - [supervisord.conf](server_config/supervisord.conf)
-
-Developers should ensure that these files with the same structure and content exist in the same directory as their app
-implementation. 
-
-
-#### App-specific files
-All app-specific files should include data or codes strictly dependent on the app's functionality.
-
-##### main.py
-Each app should be implemented in a directory that includes the [`main.py`](main.py) file, which in turn comprises either direct
-implementation of states or importing them. Moreover, `main` should import `bottle` and `api` packages:
-```angular2html
-from bottle import Bottle
-
-from api.http_ctrl import api_server
-from api.http_web import web_server
-
-import apps.examples.dice
-
-from engine.app import app
-
-server = Bottle()
-```
-One can implement desired states in [`states.py`](states.py) and import it, which because of putting 
-[`app_state`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine/README.md#registering-states-to-the-app-app_state) on top of state classes, 
-merely importing the states and registering them into the [`app` instance](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine/README.md#app-instance).     
-
-For running the app, inside a docker container, [`app.register()`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine/README.md#registering-all-transitions-appregister)
-should be called to register and verify all transitions; next, api and servers should mount at corresponding paths; and finally
-the server is ready to run the app.
-
-```angular2html
-    app.register()
-    server.mount('/api', api_server)
-    server.mount('/web', web_server)
-    server.run(host='localhost', port=5000)
+```csv
+transcription_factor  # Header row
+Gene1
+Gene2
+...
 ```
 
-All of the codes above, except for importing the app or, alternatively, implementing states, can be exactly same for all apps.  
+### Output
 
-##### requirements.txt
-for installing required python libraries inside the docker image, developers should provide a list of libraries in [requirements.txt](requirements.txt).
-Some requirements are necessary for the FeatureCloud library, which should always be listed, are:
-```angular2html
-bottle
-jsonpickle
-joblib
-numpy
-bios
-pydot
-pyyaml
+- Predicted network: A tab-separated file with three columns for transcription factors, target genes, and importance scores.
+
+## Development
+
+### Requirements
+
+- Python 3.12
+- [Docker](https://docs.docker.com/get-docker/)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python environment manager)
+- [FeatureCloud](https://featurecloud.ai/) platform
+
+### Setting up the environment
+
+1. Install the Python environment manager `uv`:
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. In the root folder of this repository, run:
+   ```bash
+   uv sync
+   ```
+
+3. Build the FeatureCloud container:
+   
+   ```bash
+   featurecloud app build . fedgenie3 latest True
+   ```
+
+4. Launch the controller and specify the directory containing the configuration and data files, e.g. `./controller_data`:
+   
+   ```bash
+   featurecloud controller start --data-dir=./controller_data
+   ```
+
+5. Assume the structure of the `controller_data` directory is as follows:
+
+   ```
+   controller_data/
+   ┣ 📂clients
+   ┃ ┣ 📂client1
+   ┃ ┃ ┣ client.yaml
+   ┃ ┃ ┣ gene_expressions_data.tsv
+   ┃ ┃ ┗ transcription_factors.tsv
+   ┃ ┗ 📂client2
+   ┃   ┣ client.yaml
+   ┃   ┣ gene_expressions_data.tsv
+   ┃   ┗ transcription_factors.tsv
+   ┗ 📂generic
+     ┗ 📜server.yaml 
+   ```
+
+   In this case, the files in the `generic` directory and only the client-specific files in the respective client directories  are mounted at `/mnt/input/` for each client. Here, the path configurations in the `client.yaml` files are only the names of the files, for instance resulting in `/mnt/input/name_of_gene_expression_data.tsv` in the container. 
+   
+   Then, to run the application in the testbed, you can use the following command to launch 2 clients:
+
+   ```bash
+   featurecloud test start --app-image fedgenie3 \
+     --client-dirs="controller_data/clients/client1,controller_data/clients/client2" \
+     --generic-dir="controller_data/generic"
+   ```
+  
+  Launching the tests on the testbed web interface is also possible and the recommended approach, since it is more convenient. See [here](https://featurecloud.ai/development/test). Note that the controller must be running in order to start testing.
+
+### Asynchronous Simulation
+
+For experimenting locally on simulated partitions of a single dataset without the full FeatureCloud infrastructure, you can use the provided asynchronous simulation script based on `asyncio`:
+
+```bash
+uv run python3 async_fed_sim.py client.yaml server.yaml 2
 ```
 
-And the rest should be all other app-required libraries.
+This simulates federated learning with 2 sites using the specified configurations by partitioning the dataset into 2 parts. 
 
-##### config.yml
-Each app may need some hyper-parameters or arguments that the end-users should provide. Such data should be included
-in [`config.yml`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app#config-file-configyml), which should be read and interpreted by the app. 
+Multiple simulation strategies can be specified in the `server.yaml` file:
 
-### Run YOUR_APPLICATION
+- `random-even`: The dataset is randomly and equally-sized partitioned into the specified number of parts.
+- `tf-centric`: The dataset is partitioned based on the results of an agglomerative clustering approach, with the number of clusters being equal to the specified number of sites.
 
-#### Prerequisite
+Multiple aggregation strategies can be specified in the `server.yaml` file, allowing for faster experimentation and resulting in distinct runs with distinct outputs. For instance:
 
-To run YOUR_APPLICATION, you should install Docker and FeatureCloud pip package:
-
-```shell
-pip install featurecloud
+```yaml
+aggregation:
+  - name: "sample-size-weighting"
+    params: 
+  - name: "invariance-weighting"
+    params: 
+      decay_exponent: 2
+simulation:
+  - name: "random-even"  # Options: random-even, tf-centric. See src/simulation.py for more details.
 ```
 
-Then either download YOUR_APPLICATION image from the FeatureCloud docker repository:
+The `client.yaml` file specifies the path to the gene expression file, the transcription factor file, and the reference network file.
 
-```shell
-featurecloud app download featurecloud.ai/YOUR_APPLICATION
+```yaml
+data:
+  gene_expressions_path: /path/to/gene_expressions_data.tsv
+  transcription_factors_path: /path/to/transcription_factors.tsv
+  reference_network_path: /path/to/reference_network.tsv
 ```
 
-Or build the app locally:
+The output will look like the following:
 
-```shell
-featurecloud app build featurecloud.ai/YOUR_APPLICATION
+```
+📦2025-03-08_10-11-05
+ ┣ 📜coordinator_config.yaml
+ ┣ 📜global_network_invariance-weighting.csv
+ ┣ 📜global_network_sample-size-weighting.csv
+ ┣ 📜local_network_1.csv
+ ┣ 📜local_network_2.csv
+ ┣ 📜metrics.csv
+ ┣ 📜participant_config.yaml
+ ┗ 📜reference_network.csv
 ```
 
-Please provide example data so others can run YOUR_APPLICATION with the desired settings in the `config.yml` file.
 
-#### Run YOUR_APPLICATION in the test-bed
+### Data Format
 
-You can run YOUR_APPLICATION as a standalone app in the [FeatureCloud test-bed](https://featurecloud.ai/development/test) or [FeatureCloud Workflow](https://featurecloud.ai/projects). You can also run the app using CLI:
+The expected format of the data files. The header rows are expected to be present in the respective files.
 
-```shell
-featurecloud test start --app-image featurecloud.ai/YOUR_APPLICATION --client-dirs './sample/c1,./sample/c2' --generic-dir './sample/generic'
+#### Gene Expression Data
+
+See above
+
+#### Transcription Factor List
+
+See above
+
+#### Reference Network
+
+The additional reference network file that will be evaluated against is a tab-separated file with columns for transcription factors, target genes, and binary labels, indicating the presence of an edge between the transcription factor and the target gene:
+
+```csv
+transcription_factor  target_gene  label
+Gene1                 Gene2        1
+Gene1                 Gene3        0
+...
 ```
 
+## Citation
 
+If you use this implementation in your research, please cite the original GENIE3 paper:
 
-### References
-<a id="1">[1]</a> 
-Matschinske, J., Späth, J., Nasirigerdeh, R., Torkzadehmahani, R., Hartebrodt, A., Orbán, B., Fejér, S., Zolotareva,
-O., Bakhtiari, M., Bihari, B. and Bloice, M., 2021.
-The FeatureCloud AI Store for Federated Learning in Biomedicine and Beyond. arXiv preprint arXiv:2105.05734.
+```bibtex
+@article{huynh-thuInferringRegulatoryNetworks2010,
+  title = {Inferring {{Regulatory Networks}} from {{Expression Data Using Tree-Based Methods}}},
+  author = {{Huynh-Thu}, V{\^a}n Anh and Irrthum, Alexandre and Wehenkel, Louis and Geurts, Pierre},
+  editor = {Isalan, Mark},
+  year = {2010},
+  month = sep,
+  journal = {PLoS ONE},
+  volume = {5},
+  number = {9},
+  pages = {e12776},
+  issn = {1932-6203},
+  doi = {10.1371/journal.pone.0012776},
+  urldate = {2024-09-23},
+  langid = {english},
+  keywords = {Gene Regulatory Networks}
+}
+```
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
