@@ -7,8 +7,11 @@ requires-python = "==3.12.*"
 dependencies = [
     "featurecloud>=0.1.0",
     "genie3",
-    "wandb>=0.19.1",
+    "loguru>=0.7.3",
 ]
+
+[tool.uv.sources]
+genie3 = { git = "https://github.com/geezah/genie3" }
 
 [dependency-groups]
 dev = [

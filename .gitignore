@@ -3,3 +3,6 @@
 *.pyc
 controller_data
 credentials.conf
+logs
+plots
+results

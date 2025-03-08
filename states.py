@@ -1,35 +1,42 @@
+"""FeatureCloud app states for federated GRN inference using GENIE3.
+
+This module implements the FeatureCloud app states for federated Gene Regulatory Network (GRN)
+inference using GENIE3. It includes states for initialization, local computation, and aggregation
+of results across multiple sites.
+"""
+
 from pathlib import Path
-from shutil import copytree
 from typing import Any, Dict, List
 
-import numpy as np
-import wandb
+import yaml
 from FeatureCloud.app.engine.app import AppState, Role, app_state
 from genie3.data import GRNDataset, init_grn_dataset
-from genie3.eval import prepare_evaluation, run_evaluation
 from genie3.genie3 import calculate_importances, rank_genes_by_importance
 from numpy.typing import NDArray
-from pandas import DataFrame
 
-from schema import CoordinatorConfig, ParticipantConfig
-from utils.aggregation import get_aggregation_strategy
-from utils.initial import read_config
-from utils.simulation import create_partitions
+from src.schema import FCCoordinatorConfig, ParticipantConfig
+from src.aggregation import get_aggregation_strategy
 
+# Path to input and output directories in the FeatureCloud docker container
 INPUT_DIR_PATH = Path("/mnt/input")
 OUTPUT_DIR_PATH = Path("/mnt/output")
 
 
 @app_state("initial", role=Role.BOTH)
 class InitialState(AppState):
+    """Initial state for loading configurations and data."""
+
     def register(self):
         self.register_transition(
             "compute_local_importance_matrix", role=Role.BOTH
         )
-        self.register_transition("simulate_partitions", role=Role.COORDINATOR)
-        self.register_transition("receive_partitions", role=Role.PARTICIPANT)
 
-    def run(self):
+    def run(self) -> str:
+        """Initialize configurations and load data.
+
+        Returns:
+            str: Name of the next state
+        """
         self.log("Initializing the application")
 
         self.log(f"Input directory path: {INPUT_DIR_PATH}")
@@ -42,17 +49,18 @@ class InitialState(AppState):
         self.log(f"Client Config path: {client_config_path}")
         self.log(f"Server Config path: {server_config_path}")
 
-        participant_config_dict: Dict[str, Any] = read_config(
-            client_config_path
-        )
+        with open(client_config_path, "r") as f:
+            participant_config_dict: Dict[str, Any] = yaml.safe_load(f)
+
         participant_config: ParticipantConfig = ParticipantConfig(
             **participant_config_dict
         )
         self.store("participant_config", participant_config)
         self.log(f"Participant Config: {participant_config}")
 
-        server_config_dict: Dict[str, Any] = read_config(server_config_path)
-        server_config: CoordinatorConfig = CoordinatorConfig(
+        with open(server_config_path, "r") as f:
+            server_config_dict: Dict[str, Any] = yaml.safe_load(f)
+        server_config: FCCoordinatorConfig = FCCoordinatorConfig(
             **server_config_dict
         )
         self.store("server_config", server_config)
@@ -61,286 +69,212 @@ class InitialState(AppState):
         gene_expressions_path = (
             INPUT_DIR_PATH / participant_config.data.gene_expressions_path
         )
-        transcription_factors_path = (
-            INPUT_DIR_PATH / participant_config.data.transcription_factors_path
-        )
-        reference_network_path = (
-            INPUT_DIR_PATH / participant_config.data.reference_network_path
-        )
+        if participant_config.data.transcription_factors_path:
+            transcription_factors_path = (
+                INPUT_DIR_PATH
+                / participant_config.data.transcription_factors_path
+            )
+        else:
+            transcription_factors_path = None
 
         self.log(f"Gene expressions path: {gene_expressions_path}")
         self.log(f"Transcription factors path: {transcription_factors_path}")
-        self.log(f"Reference network path: {reference_network_path}")
-        # Load and store the GRN dataset
+
+        # Load and store the GRN dataset without reference network
         dataset = init_grn_dataset(
             gene_expressions_path=gene_expressions_path,
             transcription_factor_path=transcription_factors_path,
-            reference_network_path=reference_network_path,
+            reference_network_path=None,  # No reference network in production
         )
         self.store("dataset", dataset)
+        
+        # Validate data consistency across clients
+        self.validate_data_consistency(dataset)
+        
+        return "compute_local_importance_matrix"
+    
+    def validate_data_consistency(self, dataset: GRNDataset) -> None:
+        """Validate that all clients have the same genes and transcription factors.
+        
+        Args:
+            dataset: The GRN dataset loaded by the client
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        # Extract gene names and transcription factor names for validation
+        gene_names = list(dataset.gene_expressions.columns)
+        tf_names = list(dataset.transcription_factor_names)
+        
+        # Send gene names and transcription factor names to coordinator for validation
+        self.send_data_to_coordinator(
+            {"gene_names": gene_names, "tf_names": tf_names},
+            send_to_self=True,
+            memo="data_validation"
+        )
+        
+        # If coordinator, validate that all clients have the same genes and transcription factors
         if self.is_coordinator:
-            if server_config.simulation is not None:
-                return "simulate_partitions"
+            # Wait for data from all clients
+            validation_data = self.gather_data(memo="data_validation")
+            
+            # Extract gene names and transcription factor names from all clients
+            all_gene_names = [data["gene_names"] for data in validation_data]
+            all_tf_names = [data["tf_names"] for data in validation_data]
+            
+            # Check if all clients have the same gene names
+            reference_genes = set(all_gene_names[0])
+            for i, client_genes in enumerate(all_gene_names[1:], 1):
+                client_genes = set(client_genes)
+                if reference_genes != client_genes:
+                    missing_genes = reference_genes - client_genes
+                    extra_genes = client_genes - reference_genes
+                    error_msg = f"Client {i} has different genes than the reference client."
+                    if missing_genes:
+                        error_msg += f" Missing genes: {missing_genes}."
+                    if extra_genes:
+                        error_msg += f" Extra genes: {extra_genes}."
+                    self.log(error_msg, level="ERROR")
+                    raise ValueError(error_msg)
+            
+            
+            # Check if all clients have the same transcription factor names
+            reference_tfs = set(all_tf_names[0])
+            for i, client_tfs in enumerate(all_tf_names[1:], 1):
+                client_tfs = set(client_tfs)
+                if reference_tfs != client_tfs:
+                    missing_tfs = reference_tfs - client_tfs        
+                    extra_tfs = client_tfs - reference_tfs
+                    error_msg = f"Client {i} has different transcription factors than the reference client."
+                    if missing_tfs:
+                        error_msg += f" Missing TFs: {missing_tfs}."
+                    if extra_tfs:
+                        error_msg += f" Extra TFs: {extra_tfs}."
+                    self.log(error_msg, level="ERROR")
+                    raise ValueError(error_msg)
+            
+            self.log("Data validation successful: All clients have the same genes and transcription factors.")
+            
+            # Broadcast validation result to all clients
+            self.broadcast_data(True, memo="validation_result")
         else:
-            if server_config.simulation is not None:
-                return "receive_partitions"
-        return "compute_local_importance_matrix"
+            # Participants wait for validation result from coordinator
+            validation_result = self.await_data(n=1, memo="validation_result")
+            if not validation_result:
+                self.log("Data validation failed. Exiting.", level="ERROR")
+                raise ValueError("Data validation failed. Check coordinator logs for details.")
+            self.log("Data validation successful.")
 
-
-@app_state("simulate_partitions", role=Role.COORDINATOR)
-class SimulatePartitions(AppState):
-    def register(self):
-        self.register_transition(
-            "compute_local_importance_matrix", role=Role.COORDINATOR
-        )
-
-    def run(self):
-        dataset: GRNDataset = self.load("dataset")
-        server_config: CoordinatorConfig = self.load("server_config")
-        indices_partitions: List[NDArray[np.int32]] = create_partitions(
-            dataset,
-            simulation_type=server_config.simulation.strategy,
-            n_partitions=len(self.clients),
-        )
-        for idx, client_id in enumerate(self.clients):
-            if client_id != self.id:
-                self.send_data_to_participant(
-                    indices_partitions[idx],
-                    client_id,
-                    memo=f"indices_partitions_{client_id}",
-                )
-            else:
-                gene_expression_partition = dataset.gene_expressions.filter(
-                    indices_partitions[idx], axis=0
-                )
-                dataset = GRNDataset(
-                    gene_expressions=gene_expression_partition,
-                    transcription_factors=dataset.transcription_factor_names,
-                    reference_network=dataset.reference_network,
-                )
-                self.store("dataset", dataset)
-        return "compute_local_importance_matrix"
-
-
-@app_state("receive_partitions", role=Role.PARTICIPANT)
-class ReceivePartitions(AppState):
-    def register(self):
-        self.register_transition(
-            "compute_local_importance_matrix", role=Role.PARTICIPANT
-        )
-
-    def run(self):
-        dataset: GRNDataset = self.load("dataset")
-        indices_partition: NDArray[np.int32] = self.await_data(
-            1, memo=f"indices_partitions_{self.id}"
-        )
-        gene_expression_partition = dataset.gene_expressions.filter(
-            indices_partition, axis=0
-        )
-        dataset = GRNDataset(
-            gene_expressions=gene_expression_partition,
-            transcription_factors=dataset.transcription_factor_names,
-            reference_network=dataset.reference_network,
-        )
-        self.store("dataset", dataset)
-        return "compute_local_importance_matrix"
+    
 
 
 @app_state("compute_local_importance_matrix", role=Role.BOTH)
 class ComputeLocalImportanceMatrix(AppState):
+    """State for computing local importance matrices at each site."""
+
     def register(self):
         self.register_transition("aggregate", role=Role.COORDINATOR)
-        self.register_transition("evaluate_local", role=Role.BOTH)
         self.register_transition("terminal", role=Role.PARTICIPANT)
 
-    def run(self):
+    def run(self) -> str:
+        """Compute local importance matrix and predicted network.
+
+        Returns:
+            str: Name of the next state
+        """
         dataset: GRNDataset = self.load("dataset")
-        participant_config: ParticipantConfig = self.load("participant_config")
+        server_config: FCCoordinatorConfig = self.load("server_config")
 
         num_samples: int = len(dataset.gene_expressions)
         self.store("num_samples", num_samples)
 
-        importance_scores = calculate_importances(
+        # Calculate local importance scores
+        importance_scores: NDArray = calculate_importances(
             dataset.gene_expressions.values,
             dataset._transcription_factor_indices,
-            participant_config.regressor.name,
-            participant_config.regressor.init_params,
-            **participant_config.regressor.fit_params,
+            server_config.regressor.name,
+            server_config.regressor.init_params,
+            **server_config.regressor.fit_params,
         )
+
         predicted_network = rank_genes_by_importance(
             importance_scores,
             dataset._transcription_factor_indices,
             dataset._gene_names,
         )
+
+        # Store results
         self.store("importance_scores", importance_scores)
         self.store("predicted_network", predicted_network)
 
+        # Send data to coordinator
         self.send_data_to_coordinator(
             importance_scores, send_to_self=True, memo="importance_scores"
         )
         self.send_data_to_coordinator(
             num_samples, send_to_self=True, memo="num_samples"
         )
-        if self.is_coordinator:
-            if dataset.reference_network is not None:
-                return "evaluate_local"
-            else:
-                return "aggregate"
-        else:
-            if dataset.reference_network is not None:
-                return "evaluate_local"
-            else:
-                return "terminal"
 
-
-@app_state("evaluate_local", role=Role.BOTH)
-class EvaluateLocal(AppState):
-    def register(self):
-        self.register_transition("terminal", role=Role.PARTICIPANT)
-        self.register_transition("aggregate", role=Role.COORDINATOR)
-
-    def run(self):
-        dataset: GRNDataset = self.load("dataset")
-        predicted_network = self.load("predicted_network")
-
-        y_preds, y_true = prepare_evaluation(
-            predicted_network, dataset.reference_network
-        )
-        results = run_evaluation(y_preds, y_true)
-
-        self.send_data_to_coordinator(
-            results.auroc, send_to_self=True, memo="auroc"
-        )
-        self.log(f"Local AUROC: {results.auroc}")
-
-        if self.is_coordinator:
-            return "aggregate"
-        else:
-            return "terminal"
+        return "aggregate" if self.is_coordinator else "terminal"
 
 
 @app_state("aggregate", role=Role.COORDINATOR)
 class AggregationState(AppState):
-    def register(self):
-        self.register_transition("evaluate_global", role=Role.COORDINATOR)
+    """State for aggregating results from all sites."""
 
-    def run(self):
-        server_config: CoordinatorConfig = self.load("server_config")
+    def register(self):
+        self.register_transition("terminal", role=Role.COORDINATOR)
+
+    def run(self) -> str:
+        """Aggregate local results and save global predictions.
+
+        Returns:
+            str: Name of the next state
+        """
+        server_config: FCCoordinatorConfig = self.load("server_config")
         dataset: GRNDataset = self.load("dataset")
 
-        # Gather data from participants
-        local_importance_scores: List[NDArray[np.float32]] = self.gather_data(
+        # Gather data from all sites
+        local_importance_scores: List[NDArray] = self.gather_data(
             memo="importance_scores"
         )
         sample_sizes: List[int] = self.gather_data(memo="num_samples")
 
-        # Aggregate the importance scores using the specified strategy
-        if not isinstance(server_config.aggregation, list):
-            server_config.aggregation = [server_config.aggregation]
-
-        global_importance_matrices: Dict[str, NDArray] = {}
-        global_predicted_networks: Dict[str, DataFrame] = {}
-        for aggregation_config in server_config.aggregation:
-            aggregation_strategy = get_aggregation_strategy(
-                aggregation_config.name
-            )
-            global_importance_matrices[f"{aggregation_config.name}"] = (
-                aggregation_strategy(
-                    local_importance_scores,
-                    sample_sizes,
-                    **aggregation_config.params,
-                )
-            )
-            global_predicted_network = rank_genes_by_importance(
-                global_importance_matrices[f"{aggregation_config.name}"],
-                dataset._transcription_factor_indices,
-                dataset._gene_names,
-            )
-            global_predicted_networks[f"{aggregation_config.name}"] = (
-                aggregation_config.params,
-                global_predicted_network,
-            )
-        self.store("global_importance_matrices", global_importance_matrices)
-        self.store("global_predicted_networks", global_predicted_networks)
-        return "evaluate_global"
-
-
-@app_state("evaluate_global", role=Role.COORDINATOR)
-class EvaluateGlobal(AppState):
-    def register(self):
-        self.register_transition("terminal", role=Role.COORDINATOR)
-
-    def run(self):
-        dataset: GRNDataset = self.load("dataset")
-        global_predicted_networks: Dict[str, DataFrame] = self.load(
-            "global_predicted_networks"
+        # Aggregate importance matrices
+        aggregation_strategy = get_aggregation_strategy(
+            server_config.aggregation.name
         )
-        participant_config: ParticipantConfig = self.load("participant_config")
-        server_config: CoordinatorConfig = self.load("server_config")
-
-        local_aurocs: List[float] = self.gather_data(memo="auroc")
-        self.log(f"Local AUROCs: {local_aurocs}")
-
-        # Compute the average local AUROC
-        local_aurocs_average: float = np.mean(
-            local_aurocs, axis=0, dtype=np.float32
+        global_importance_matrix: NDArray = aggregation_strategy(
+            local_importance_scores,
+            sample_sizes,
+            **server_config.aggregation.params,
         )
-        self.log(f"Average local AUROC: {local_aurocs_average}")
 
-        wandb_config = {
-            "data.gene_expressions_path": participant_config.data.gene_expressions_path,
-            "data.transcription_factors_path": participant_config.data.transcription_factors_path,
-            "data.reference_network_path": participant_config.data.reference_network_path,
-            "simulation.strategy": server_config.simulation.strategy,
-            "num_sites": len(self.clients),
-            "regressor.name": participant_config.regressor.name,
-            "regressor.init_params": participant_config.regressor.init_params,
-            "regressor.fit_params": participant_config.regressor.fit_params,
-            "aggregation.name": "local",
-            "aggregation.params": {},
-        }
+        # Generate global predictions
+        global_predicted_network = rank_genes_by_importance(
+            global_importance_matrix,
+            dataset._transcription_factor_indices,
+            dataset._gene_names,
+        )
 
-        with wandb.init(
-            project="fedgenie3",
-            config=wandb_config,
-            mode="offline",
-        ) as run:
-            run.log({"auroc": local_aurocs})
+        # Log results
+        self.log(
+            f"Aggregation: {server_config.aggregation.name} "
+            f"with params: {server_config.aggregation.params}"
+        )
+        self.log(
+            f"Global predicted network preview:\n{global_predicted_network.head(2)}"
+        )
 
-        for aggregation_name, (
-            aggregation_params,
-            global_predicted_network,
-        ) in global_predicted_networks.items():
-            self.log(
-                f"Aggregation: {aggregation_name} with params: {aggregation_params}"
-            )
-            self.log(
-                f"Global predicted network: {global_predicted_network.head(2)}"
-            )
-            y_preds, y_true = prepare_evaluation(
-                global_predicted_network, dataset.reference_network
-            )
-            results = run_evaluation(y_preds, y_true)
-            wandb_config = {
-                "data.gene_expressions_path": participant_config.data.gene_expressions_path,
-                "data.transcription_factors_path": participant_config.data.transcription_factors_path,
-                "data.reference_network_path": participant_config.data.reference_network_path,
-                "simulation.strategy": server_config.simulation.strategy,
-                "num_sites": len(self.clients),
-                "regressor.name": participant_config.regressor.name,
-                "regressor.init_params": participant_config.regressor.init_params,
-                "regressor.fit_params": participant_config.regressor.fit_params,
-                "aggregation.name": aggregation_name,
-                "aggregation.params": aggregation_params,
-            }
-            with wandb.init(
-                project="fedgenie3",
-                config=wandb_config,
-                mode="offline",
-            ) as run:
-                run.log({"auroc": results.auroc})
-            self.log(f"Global AUROC: {results.auroc}")
+        # Save outputs
+        output_network_path = OUTPUT_DIR_PATH / "global_predicted_network.csv"
+        global_predicted_network.to_csv(output_network_path, index=False)
 
-        copytree("./wandb", OUTPUT_DIR_PATH / "wandb")
+        # Save coordinator config
+        output_config_path = OUTPUT_DIR_PATH / "coordinator_config.yaml"
+        with open(output_config_path, "w") as f:
+            yaml.safe_dump(server_config.model_dump(), f)
+        
+        self.log(f"Global predicted network saved to {output_network_path}")
 
         return "terminal"
