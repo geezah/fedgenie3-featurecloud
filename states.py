@@ -14,7 +14,7 @@ from genie3.data import GRNDataset, init_grn_dataset
 from genie3.genie3 import calculate_importances, rank_genes_by_importance
 from numpy.typing import NDArray
 
-from src.schema import FCCoordinatorConfig, ParticipantConfig
+from src.config import FCCoordinatorConfig, ParticipantConfig
 from src.aggregation import get_aggregation_strategy
 
 # Path to input and output directories in the FeatureCloud docker container

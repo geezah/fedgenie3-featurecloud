@@ -30,7 +30,7 @@ from loguru import logger
 from numpy.typing import NDArray
 from typer import Typer
 
-from src.schema import ParticipantConfig, SimCoordinatorConfig
+from src.config import ParticipantConfig, SimCoordinatorConfig
 from src.aggregation import get_aggregation_strategy
 from src.simulation import create_partitions
 
