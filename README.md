@@ -44,6 +44,10 @@ Federated GENIE3 extends the original GENIE3 approach to a distributed setting. 
 
 For detailed information on the configuration schema, see [the configuration schema of this application](src/config.py) and [the configuration schema of the core package](https://github.com/geezah/genie3/blob/main/genie3/config.py).  
 
+### Output
+
+- Predicted network: A tab-separated file with three columns for transcription factors, target genes, and importance scores.
+
 ### Data Format
 
 The expected format of the data files. The header rows are expected to be present in the respective files.
@@ -69,10 +73,6 @@ Gene1
 Gene2
 ...
 ```
-
-### Output
-
-- Predicted network: A tab-separated file with three columns for transcription factors, target genes, and importance scores.
 
 ## Development
 
